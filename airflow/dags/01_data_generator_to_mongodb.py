@@ -29,7 +29,8 @@ COUNTRIES = ["USA", "UK", "Germany", "France", "Canada", "Australia", "Japan", "
     start_date=datetime(2026, 1, 1),
     schedule="* * * * *",  # Every 1 min
     catchup=False,
-    tags=["ecommerce", "generator", "mongodb"]
+    tags=["ecommerce", "generator", "mongodb"],
+    description="Генерирует данные для MongoDB"
 )
 def data_generator_to_mongodb():
     
