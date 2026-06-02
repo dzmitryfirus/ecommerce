@@ -15,7 +15,7 @@ ECOMMERCE_DATASET = Dataset("postgres://warehouse/dds_ecommerce_data")
 
 
 # ============================================================
-# Pydantic модели 
+# Pydantic модели
 # ============================================================
 
 class UserModel(BaseModel):
@@ -129,7 +129,7 @@ class EventModel(BaseModel):
 
 
 # ============================================================
-# DAG Producer с DDS слоем
+# DAG Producer
 # ============================================================
 
 @dag(
@@ -151,21 +151,18 @@ def ecommerce_producer_dag():
     @task
     def start_process() -> str:
         logger.info("=" * 60)
-        logger.info("🚀 Начало работы E-commerce Producer DAG (с DDS слоем)")
+        logger.info("🚀 Начало работы E-commerce Producer DAG")
         logger.info(f"Время запуска: {datetime.now()}")
         logger.info("=" * 60)
         return "started"
     
     @task
     def create_postgres_tables() -> bool:
-        """Создание Staging и DDS таблиц в PostgreSQL"""
+        """Создание Staging и DDS таблиц"""
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
         create_tables_sql = """
-        -- ============================================
-        -- STAGING LAYER (сырые валидированные данные)
-        -- ============================================
-        
+        -- STAGING TABLES
         CREATE TABLE IF NOT EXISTS stg_ecommerce_users (
             user_id TEXT PRIMARY KEY,
             first_name TEXT NOT NULL,
@@ -225,11 +222,7 @@ def ecommerce_producer_dag():
             loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         
-        -- ============================================
-        -- DDS LAYER (Data Delivery Store - звездная схема)
-        -- ============================================
-        
-        -- Измерение: Дата
+        -- DDS TABLES
         CREATE TABLE IF NOT EXISTS dds_dim_date (
             date_sk SERIAL PRIMARY KEY,
             date DATE NOT NULL UNIQUE,
@@ -244,7 +237,6 @@ def ecommerce_producer_dag():
             is_weekend BOOLEAN NOT NULL
         );
         
-        -- Измерение: Пользователь (SCD Type 2)
         CREATE TABLE IF NOT EXISTS dds_dim_users (
             user_sk SERIAL PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -261,7 +253,6 @@ def ecommerce_producer_dag():
             is_current BOOLEAN DEFAULT TRUE
         );
         
-        -- Измерение: Товар
         CREATE TABLE IF NOT EXISTS dds_dim_products (
             product_sk SERIAL PRIMARY KEY,
             product_id TEXT NOT NULL UNIQUE,
@@ -271,7 +262,6 @@ def ecommerce_producer_dag():
             price_category TEXT NOT NULL
         );
         
-        -- Факт: Продажи
         CREATE TABLE IF NOT EXISTS dds_fact_sales (
             sale_sk SERIAL PRIMARY KEY,
             date_sk INTEGER NOT NULL REFERENCES dds_dim_date(date_sk),
@@ -283,7 +273,6 @@ def ecommerce_producer_dag():
             loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         
-        -- Факт: События
         CREATE TABLE IF NOT EXISTS dds_fact_events (
             event_sk SERIAL PRIMARY KEY,
             date_sk INTEGER NOT NULL REFERENCES dds_dim_date(date_sk),
@@ -298,24 +287,21 @@ def ecommerce_producer_dag():
             loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         
-        -- Индексы для DDS таблиц
         CREATE INDEX IF NOT EXISTS idx_dds_fact_sales_date ON dds_fact_sales(date_sk);
         CREATE INDEX IF NOT EXISTS idx_dds_fact_sales_user ON dds_fact_sales(user_sk);
         CREATE INDEX IF NOT EXISTS idx_dds_fact_sales_product ON dds_fact_sales(product_sk);
-        CREATE INDEX IF NOT EXISTS idx_dds_fact_events_date ON dds_fact_events(date_sk);
-        CREATE INDEX IF NOT EXISTS idx_dds_fact_events_user ON dds_fact_events(user_sk);
         """
         
         try:
             hook.run(create_tables_sql)
-            logger.info("✅ Staging и DDS таблицы созданы/проверены в PostgreSQL")
+            logger.info("✅ Staging и DDS таблицы созданы/проверены")
             return True
         except Exception as e:
-            logger.error(f"❌ Ошибка при создании таблиц: {e}")
+            logger.error(f"❌ Ошибка: {e}")
             raise
     
     # ============================================================
-    # EXTRACT из MongoDB 
+    # EXTRACT
     # ============================================================
     
     @task
@@ -323,67 +309,47 @@ def ecommerce_producer_dag():
         mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
         five_min_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
         
-        try:
-            with MongoClient(mongo_uri) as client:
-                db = client["source_db"]
-                collection = db["ecommerce_users"]
-                users = list(collection.find({"created_at": {"$gte": five_min_ago}}, {"_id": 0}))
-                logger.info(f"✅ Извлечено пользователей: {len(users)}")
-                return users
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            raise
+        with MongoClient(mongo_uri) as client:
+            db = client["source_db"]
+            users = list(db["ecommerce_users"].find({"created_at": {"$gte": five_min_ago}}, {"_id": 0}))
+            logger.info(f"✅ Извлечено пользователей: {len(users)}")
+            return users
     
     @task
     def extract_products() -> List[Dict]:
         mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
         five_min_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
         
-        try:
-            with MongoClient(mongo_uri) as client:
-                db = client["source_db"]
-                collection = db["ecommerce_products"]
-                products = list(collection.find({"created_at": {"$gte": five_min_ago}}, {"_id": 0}))
-                logger.info(f"✅ Извлечено товаров: {len(products)}")
-                return products
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            raise
+        with MongoClient(mongo_uri) as client:
+            db = client["source_db"]
+            products = list(db["ecommerce_products"].find({"created_at": {"$gte": five_min_ago}}, {"_id": 0}))
+            logger.info(f"✅ Извлечено товаров: {len(products)}")
+            return products
     
     @task
     def extract_orders() -> List[Dict]:
         mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
         five_min_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
         
-        try:
-            with MongoClient(mongo_uri) as client:
-                db = client["source_db"]
-                collection = db["ecommerce_orders"]
-                orders = list(collection.find({"created_at": {"$gte": five_min_ago}}, {"_id": 0}))
-                logger.info(f"✅ Извлечено заказов: {len(orders)}")
-                return orders
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            raise
+        with MongoClient(mongo_uri) as client:
+            db = client["source_db"]
+            orders = list(db["ecommerce_orders"].find({"created_at": {"$gte": five_min_ago}}, {"_id": 0}))
+            logger.info(f"✅ Извлечено заказов: {len(orders)}")
+            return orders
     
     @task
     def extract_events() -> List[Dict]:
         mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
         five_min_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
         
-        try:
-            with MongoClient(mongo_uri) as client:
-                db = client["source_db"]
-                collection = db["ecommerce_events"]
-                events = list(collection.find({"timestamp": {"$gte": five_min_ago}}, {"_id": 0}))
-                logger.info(f"✅ Извлечено событий: {len(events)}")
-                return events
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            raise
+        with MongoClient(mongo_uri) as client:
+            db = client["source_db"]
+            events = list(db["ecommerce_events"].find({"timestamp": {"$gte": five_min_ago}}, {"_id": 0}))
+            logger.info(f"✅ Извлечено событий: {len(events)}")
+            return events
     
     # ============================================================
-    # VALIDATION 
+    # VALIDATION
     # ============================================================
     
     @task
@@ -403,10 +369,9 @@ def ecommerce_producer_dag():
                 invalid_count += 1
                 error_type = type(e).__name__
                 invalid_by_reason[error_type] = invalid_by_reason.get(error_type, 0) + 1
-                logger.warning(f"❌ Ошибка валидации пользователя {user.get('user_id')}: {e}")
         
         logger.info(f"📊 Пользователи: валидных {len(valid_users)}, невалидных {invalid_count}")
-        return {"total": len(users), "valid": len(valid_users), "invalid": invalid_count, 
+        return {"total": len(users), "valid": len(valid_users), "invalid": invalid_count,
                 "invalid_by_reason": invalid_by_reason, "valid_data": valid_users}
     
     @task
@@ -426,7 +391,6 @@ def ecommerce_producer_dag():
                 invalid_count += 1
                 error_type = type(e).__name__
                 invalid_by_reason[error_type] = invalid_by_reason.get(error_type, 0) + 1
-                logger.warning(f"❌ Ошибка валидации товара {product.get('product_id')}: {e}")
         
         logger.info(f"📊 Товары: валидных {len(valid_products)}, невалидных {invalid_count}")
         return {"total": len(products), "valid": len(valid_products), "invalid": invalid_count,
@@ -449,7 +413,6 @@ def ecommerce_producer_dag():
                 invalid_count += 1
                 error_type = type(e).__name__
                 invalid_by_reason[error_type] = invalid_by_reason.get(error_type, 0) + 1
-                logger.warning(f"❌ Ошибка валидации заказа {order.get('order_id')}: {e}")
         
         logger.info(f"📊 Заказы: валидных {len(valid_orders)}, невалидных {invalid_count}")
         return {"total": len(orders), "valid": len(valid_orders), "invalid": invalid_count,
@@ -472,14 +435,13 @@ def ecommerce_producer_dag():
                 invalid_count += 1
                 error_type = type(e).__name__
                 invalid_by_reason[error_type] = invalid_by_reason.get(error_type, 0) + 1
-                logger.warning(f"❌ Ошибка валидации события {event.get('event_id')}: {e}")
         
         logger.info(f"📊 События: валидных {len(valid_events)}, невалидных {invalid_count}")
         return {"total": len(events), "valid": len(valid_events), "invalid": invalid_count,
                 "invalid_by_reason": invalid_by_reason, "valid_data": valid_events}
     
     # ============================================================
-    # LOAD TO STAGING 
+    # LOAD TO STAGING
     # ============================================================
     
     @task
@@ -490,24 +452,20 @@ def ecommerce_producer_dag():
         
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
-        upsert_sql = """
-        INSERT INTO stg_ecommerce_users 
-            (user_id, first_name, last_name, email, phone, country, age, 
-             registration_date, is_active, lifetime_value, created_at)
-        VALUES (%(user_id)s, %(first_name)s, %(last_name)s, %(email)s, 
-                %(phone)s, %(country)s, %(age)s, %(registration_date)s, 
-                %(is_active)s, %(lifetime_value)s, %(created_at)s)
-        ON CONFLICT (user_id) DO UPDATE SET
-            first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name,
-            email = EXCLUDED.email, phone = EXCLUDED.phone, country = EXCLUDED.country,
-            age = EXCLUDED.age, lifetime_value = EXCLUDED.lifetime_value,
-            is_active = EXCLUDED.is_active, loaded_at = NOW()
-        """
-        
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
                 for user in valid_users:
-                    cur.execute(upsert_sql, user)
+                    cur.execute("""
+                        INSERT INTO stg_ecommerce_users 
+                        (user_id, first_name, last_name, email, phone, country, age, registration_date, is_active, lifetime_value, created_at)
+                        VALUES (%(user_id)s, %(first_name)s, %(last_name)s, %(email)s, %(phone)s, %(country)s, %(age)s, 
+                                %(registration_date)s, %(is_active)s, %(lifetime_value)s, %(created_at)s)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name,
+                            email = EXCLUDED.email, phone = EXCLUDED.phone, country = EXCLUDED.country,
+                            age = EXCLUDED.age, lifetime_value = EXCLUDED.lifetime_value,
+                            is_active = EXCLUDED.is_active, loaded_at = NOW()
+                    """, user)
                 conn.commit()
         
         logger.info(f"💾 Загружено пользователей в staging: {len(valid_users)}")
@@ -521,21 +479,18 @@ def ecommerce_producer_dag():
         
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
-        upsert_sql = """
-        INSERT INTO stg_ecommerce_products 
-            (product_id, name, category, price, stock, rating, created_at)
-        VALUES (%(product_id)s, %(name)s, %(category)s, %(price)s, 
-                %(stock)s, %(rating)s, %(created_at)s)
-        ON CONFLICT (product_id) DO UPDATE SET
-            name = EXCLUDED.name, category = EXCLUDED.category,
-            price = EXCLUDED.price, stock = EXCLUDED.stock,
-            rating = EXCLUDED.rating, loaded_at = NOW()
-        """
-        
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
                 for product in valid_products:
-                    cur.execute(upsert_sql, product)
+                    cur.execute("""
+                        INSERT INTO stg_ecommerce_products 
+                        (product_id, name, category, price, stock, rating, created_at)
+                        VALUES (%(product_id)s, %(name)s, %(category)s, %(price)s, %(stock)s, %(rating)s, %(created_at)s)
+                        ON CONFLICT (product_id) DO UPDATE SET
+                            name = EXCLUDED.name, category = EXCLUDED.category,
+                            price = EXCLUDED.price, stock = EXCLUDED.stock,
+                            rating = EXCLUDED.rating, loaded_at = NOW()
+                    """, product)
                 conn.commit()
         
         logger.info(f"💾 Загружено товаров в staging: {len(valid_products)}")
@@ -590,33 +545,30 @@ def ecommerce_producer_dag():
         
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
-        upsert_sql = """
-        INSERT INTO stg_ecommerce_events 
-            (event_id, user_id, event_type, session_id, timestamp, page, device, browser, referrer)
-        VALUES (%(event_id)s, %(user_id)s, %(event_type)s, %(session_id)s, 
-                %(timestamp)s, %(page)s, %(device)s, %(browser)s, %(referrer)s)
-        ON CONFLICT (event_id) DO NOTHING
-        """
-        
         with hook.get_conn() as conn:
             with conn.cursor() as cur:
                 for event in valid_events:
-                    cur.execute(upsert_sql, event)
+                    cur.execute("""
+                        INSERT INTO stg_ecommerce_events 
+                        (event_id, user_id, event_type, session_id, timestamp, page, device, browser, referrer)
+                        VALUES (%(event_id)s, %(user_id)s, %(event_type)s, %(session_id)s, 
+                                %(timestamp)s, %(page)s, %(device)s, %(browser)s, %(referrer)s)
+                        ON CONFLICT (event_id) DO NOTHING
+                    """, event)
                 conn.commit()
         
         logger.info(f"💾 Загружено событий в staging: {len(valid_events)}")
         return len(valid_events)
     
     # ============================================================
-    # TRANSFORM TO DDS (НОВЫЙ СЛОЙ)
+    # TRANSFORM TO DDS (ИСПРАВЛЕНО)
     # ============================================================
     
     @task
     def transform_date_dimension():
-        """Заполнение измерения Дата (DDS)"""
+        """Заполнение измерения Дата"""
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
-        # Заполняем даты на 2 года вперед и назад от текущей
         hook.run("""
             INSERT INTO dds_dim_date (date, year, quarter, month, month_name, day, day_of_week, day_name, week_of_year, is_weekend)
             WITH date_range AS (
@@ -647,21 +599,28 @@ def ecommerce_producer_dag():
     
     @task
     def transform_user_dimension():
-        """Заполнение измерения Пользователь (DDS) с SCD Type 2"""
+        """Заполнение измерения Пользователь (SCD Type 2) - ИСПРАВЛЕНО"""
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
-        # Обновляем старые записи (is_current = FALSE)
+        # Получаем максимальную дату загрузки
+        max_loaded = hook.get_first("""
+            SELECT COALESCE(MAX(loaded_at), '1900-01-01'::timestamp) 
+            FROM dds_dim_users WHERE is_current = TRUE
+        """)[0]
+        
+        # Закрываем старые версии пользователей
         hook.run("""
             UPDATE dds_dim_users 
             SET valid_to = CURRENT_DATE - INTERVAL '1 day', is_current = FALSE
             WHERE is_current = TRUE 
             AND user_id IN (
-                SELECT user_id FROM stg_ecommerce_users 
-                WHERE loaded_at > (SELECT COALESCE(MAX(loaded_at), '1900-01-01') FROM dds_dim_users WHERE user_id = stg_ecommerce_users.user_id)
+                SELECT DISTINCT user_id 
+                FROM stg_ecommerce_users 
+                WHERE loaded_at > %s
             )
-        """)
+        """, parameters=(max_loaded,))
         
-        # Вставляем новые версии пользователей
+        # Вставляем новые версии
         hook.run("""
             INSERT INTO dds_dim_users 
                 (user_id, first_name, last_name, email, phone, country, age, age_group, lifetime_value, valid_from, is_current)
@@ -693,7 +652,7 @@ def ecommerce_producer_dag():
     
     @task
     def transform_product_dimension():
-        """Заполнение измерения Товар (DDS)"""
+        """Заполнение измерения Товар"""
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
         hook.run("""
@@ -722,7 +681,7 @@ def ecommerce_producer_dag():
     
     @task
     def transform_fact_sales():
-        """Заполнение факта Продажи (DDS)"""
+        """Заполнение факта Продажи"""
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
         hook.run("""
@@ -749,7 +708,7 @@ def ecommerce_producer_dag():
     
     @task
     def transform_fact_events():
-        """Заполнение факта События (DDS)"""
+        """Заполнение факта События"""
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
         hook.run("""
@@ -778,9 +737,8 @@ def ecommerce_producer_dag():
     @task
     def log_summary(users_count, products_count, orders_count, events_count, 
                     dim_date, dim_users, dim_products, fact_sales, fact_events):
-        """Логирование итоговой статистики"""
         logger.info("=" * 60)
-        logger.info("📊 PRODUCER DAG COMPLETED (с DDS слоем)")
+        logger.info("📊 PRODUCER DAG COMPLETED")
         logger.info(f"   Staging - Users: {users_count}, Products: {products_count}, Orders: {orders_count}, Events: {events_count}")
         logger.info(f"   DDS - DimDate: {dim_date}, DimUsers: {dim_users}, DimProducts: {dim_products}")
         logger.info(f"   DDS - FactSales: {fact_sales}, FactEvents: {fact_events}")
@@ -797,32 +755,27 @@ def ecommerce_producer_dag():
     start = start_process()
     create_tables = create_postgres_tables()
     
-    # Extract
     users = extract_users()
     products = extract_products()
     orders = extract_orders()
     events = extract_events()
     
-    # Validate
     users_validated = validate_users(users)
     products_validated = validate_products(products)
     orders_validated = validate_orders(orders)
     events_validated = validate_events(events)
     
-    # Load to Staging
     users_loaded = load_users_to_staging(users_validated)
     products_loaded = load_products_to_staging(products_validated)
     orders_loaded = load_orders_to_staging(orders_validated)
     events_loaded = load_events_to_staging(events_validated)
     
-# Transform to DDS (зависит от успешной загрузки в staging)
     dim_date = transform_date_dimension()
     dim_users = transform_user_dimension()
     dim_products = transform_product_dimension()
     fact_sales = transform_fact_sales()
     fact_events = transform_fact_events()
     
-    # Dataset публикуется после загрузки DDS
     dataset_published = publish_dataset()
     
     summary = log_summary(users_loaded, products_loaded, orders_loaded, events_loaded,
@@ -837,7 +790,6 @@ def ecommerce_producer_dag():
     orders >> orders_validated >> orders_loaded
     events >> events_validated >> events_loaded
     
-    # Staging → DDS трансформации
     [users_loaded, products_loaded, orders_loaded, events_loaded] >> dim_date
     [users_loaded, products_loaded, orders_loaded, events_loaded] >> dim_users
     [users_loaded, products_loaded, orders_loaded, events_loaded] >> dim_products

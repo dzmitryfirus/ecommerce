@@ -33,7 +33,6 @@ def ecommerce_consumer_dag():
         """Создание таблиц в ClickHouse если не существуют"""
         ch = Client(**CLICKHOUSE_CONFIG)
         
-        # Витрина: ежедневные продажи
         ch.execute("""
             CREATE TABLE IF NOT EXISTS dm_daily_sales (
                 sale_date Date,
@@ -46,7 +45,6 @@ def ecommerce_consumer_dag():
             ORDER BY sale_date
         """)
         
-        # Витрина: эффективность категорий
         ch.execute("""
             CREATE TABLE IF NOT EXISTS dm_category_performance (
                 category String,
@@ -59,21 +57,6 @@ def ecommerce_consumer_dag():
             ORDER BY category
         """)
         
-        # Витрина: поведение пользователей
-        ch.execute("""
-            CREATE TABLE IF NOT EXISTS dm_user_behavior (
-                user_id String,
-                total_events UInt64,
-                total_sessions UInt64,
-                total_orders UInt64,
-                total_spent Float64,
-                last_active_date Date,
-                loaded_at DateTime
-            ) ENGINE = ReplacingMergeTree(loaded_at)
-            ORDER BY user_id
-        """)
-        
-        # Витрина: топ товаров
         ch.execute("""
             CREATE TABLE IF NOT EXISTS dm_top_products (
                 product_id String,
@@ -87,7 +70,6 @@ def ecommerce_consumer_dag():
             ORDER BY rank
         """)
         
-        # Витрина: DAU/WAU метрики
         ch.execute("""
             CREATE TABLE IF NOT EXISTS dm_daily_active_users (
                 date Date,
@@ -106,14 +88,12 @@ def ecommerce_consumer_dag():
     
     @task
     def load_daily_sales():
-        """Загрузка ежедневных продаж в ClickHouse (из DDS факта продаж)"""
+        """Загрузка ежедневных продаж в ClickHouse"""
         pg = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         ch = Client(**CLICKHOUSE_CONFIG)
         
-        # Очищаем данные за последние 30 дней
         ch.execute("ALTER TABLE dm_daily_sales DELETE WHERE sale_date >= today() - 30")
         
-        # Используем DDS слой: факт продаж + измерение даты
         result = pg.get_records("""
             SELECT 
                 d.date as sale_date,
@@ -145,7 +125,7 @@ def ecommerce_consumer_dag():
     
     @task
     def load_category_performance():
-        """Загрузка эффективности категорий в ClickHouse (из DDS)"""
+        """Загрузка эффективности категорий в ClickHouse"""
         pg = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         ch = Client(**CLICKHOUSE_CONFIG)
         
@@ -181,40 +161,59 @@ def ecommerce_consumer_dag():
     
     @task
     def load_user_behavior():
-        """Загрузка поведения пользователей в ClickHouse (из DDS)"""
+        """Загрузка поведения пользователей в ClickHouse (исправлено)"""
         pg = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         ch = Client(**CLICKHOUSE_CONFIG)
+        
+        # Пересоздаём таблицу с правильной структурой
+        ch.execute("DROP TABLE IF EXISTS dm_user_behavior")
+        
+        ch.execute("""
+            CREATE TABLE IF NOT EXISTS dm_user_behavior (
+                user_id String,
+                total_events UInt64,
+                total_sessions UInt64,
+                total_orders UInt64,
+                total_spent Float64,
+                first_active_date Date,
+                last_active_date Date,
+                loaded_at DateTime
+            ) ENGINE = ReplacingMergeTree(loaded_at)
+            ORDER BY user_id
+        """)
         
         result = pg.get_records("""
             WITH user_events AS (
                 SELECT 
                     u.user_id,
-                    COUNT(DISTINCT fe.event_id) as total_events,
-                    COUNT(DISTINCT fe.session_id) as total_sessions
+                    COUNT(DISTINCT fe.event_id) as events_count,
+                    COUNT(DISTINCT fe.session_id) as sessions_count,
+                    MIN(d.date) as first_active,
+                    MAX(d.date) as last_active
                 FROM dds_fact_events fe
                 JOIN dds_dim_users u ON fe.user_sk = u.user_sk
                 JOIN dds_dim_date d ON fe.date_sk = d.date_sk
-                WHERE u.is_current = TRUE AND d.date >= CURRENT_DATE - INTERVAL '30 days'
+                WHERE u.is_current = TRUE
                 GROUP BY u.user_id
             ),
             user_orders AS (
                 SELECT 
                     u.user_id,
-                    COUNT(DISTINCT fs.order_id) as total_orders,
-                    SUM(fs.amount) as total_spent
+                    COUNT(DISTINCT fs.order_id) as orders_count,
+                    SUM(fs.amount) as spent_amount
                 FROM dds_fact_sales fs
                 JOIN dds_dim_users u ON fs.user_sk = u.user_sk
-                JOIN dds_dim_date d ON fs.date_sk = d.date_sk
-                WHERE u.is_current = TRUE AND d.date >= CURRENT_DATE - INTERVAL '30 days'
+                WHERE u.is_current = TRUE
                 GROUP BY u.user_id
             )
             SELECT 
                 COALESCE(ue.user_id, uo.user_id) as user_id,
-                COALESCE(ue.total_events, 0) as total_events,
-                COALESCE(ue.total_sessions, 0) as total_sessions,
-                COALESCE(uo.total_orders, 0) as total_orders,
-                COALESCE(uo.total_spent, 0) as total_spent,
-                CURRENT_DATE as last_active_date
+                COALESCE(ue.events_count, 0) as events_count,
+                COALESCE(ue.sessions_count, 0) as sessions_count,
+                COALESCE(uo.orders_count, 0) as orders_count,
+                COALESCE(uo.spent_amount, 0) as spent_amount,
+                COALESCE(ue.first_active, CURRENT_DATE) as first_active_date,
+                COALESCE(ue.last_active, CURRENT_DATE) as last_active_date
             FROM user_events ue
             FULL OUTER JOIN user_orders uo ON ue.user_id = uo.user_id
         """)
@@ -226,21 +225,28 @@ def ecommerce_consumer_dag():
         for row in result:
             ch.execute(f"""
                 INSERT INTO dm_user_behavior 
-                (user_id, total_events, total_sessions, total_orders, total_spent, last_active_date, loaded_at)
-                VALUES ('{row[0]}', {row[1]}, {row[2]}, {row[3]}, {row[4]}, '{row[5]}', now())
+                (user_id, total_events, total_sessions, total_orders, total_spent, 
+                 first_active_date, last_active_date, loaded_at)
+                VALUES (
+                    '{row[0]}', {row[1]}, {row[2]}, {row[3]}, {row[4]}, 
+                    '{row[5]}', '{row[6]}', now()
+                )
             """)
         
-        logger.info(f"✅ Загружено {len(result)} записей в dm_user_behavior")
+        ch.execute("OPTIMIZE TABLE dm_user_behavior FINAL")
+        
+        count = ch.execute("SELECT COUNT(*) FROM dm_user_behavior")[0][0]
+        logger.info(f"✅ Загружено {count} записей в dm_user_behavior")
+        
         ch.disconnect()
-        return len(result)
+        return count
     
     @task
     def load_top_products():
-        """Загрузка топ товаров в ClickHouse (из DDS)"""
+        """Загрузка топ товаров в ClickHouse"""
         pg = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         ch = Client(**CLICKHOUSE_CONFIG)
         
-        # Очищаем всю таблицу
         ch.execute("TRUNCATE TABLE dm_top_products")
         
         result = pg.get_records("""
@@ -251,7 +257,6 @@ def ecommerce_consumer_dag():
                     p.category,
                     SUM(fs.quantity) as total_quantity_sold,
                     SUM(fs.amount) as total_revenue,
-                    COUNT(DISTINCT fs.order_id) as number_of_orders,
                     ROW_NUMBER() OVER (ORDER BY SUM(fs.amount) DESC) as rank
                 FROM dds_fact_sales fs
                 JOIN dds_dim_products p ON fs.product_sk = p.product_sk
@@ -281,11 +286,10 @@ def ecommerce_consumer_dag():
     
     @task
     def load_daily_active_users():
-        """Загрузка DAU/WAU метрик в ClickHouse (из DDS)"""
+        """Загрузка DAU/WAU метрик в ClickHouse"""
         pg = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         ch = Client(**CLICKHOUSE_CONFIG)
         
-        # Очищаем данные за последние 30 дней
         ch.execute("ALTER TABLE dm_daily_active_users DELETE WHERE date >= today() - 30")
         
         result = pg.get_records("""
@@ -293,15 +297,6 @@ def ecommerce_consumer_dag():
                 SELECT 
                     d.date,
                     COUNT(DISTINCT fe.user_sk) as dau
-                FROM dds_fact_events fe
-                JOIN dds_dim_date d ON fe.date_sk = d.date_sk
-                WHERE d.date >= CURRENT_DATE - INTERVAL '30 days'
-                GROUP BY d.date
-            ),
-            weekly_users AS (
-                SELECT 
-                    d.date,
-                    COUNT(DISTINCT fe.user_sk) as wau
                 FROM dds_fact_events fe
                 JOIN dds_dim_date d ON fe.date_sk = d.date_sk
                 WHERE d.date >= CURRENT_DATE - INTERVAL '30 days'
@@ -318,14 +313,8 @@ def ecommerce_consumer_dag():
             SELECT 
                 d.date,
                 d.dau,
-                COALESCE(w.wau, 0) as wau,
-                CASE 
-                    WHEN COALESCE(w.wau, 0) = 0 THEN 0 
-                    ELSE d.dau::float / w.wau 
-                END as dau_wau_ratio,
                 COALESCE(n.new_users, 0) as new_users
             FROM daily_users d
-            LEFT JOIN weekly_users w ON d.date = w.date
             LEFT JOIN new_users n ON d.date = n.date
             ORDER BY d.date DESC
         """)
@@ -338,7 +327,7 @@ def ecommerce_consumer_dag():
             ch.execute(f"""
                 INSERT INTO dm_daily_active_users 
                 (date, dau, wau, dau_wau_ratio, new_users, loaded_at)
-                VALUES ('{row[0]}', {row[1]}, {row[2]}, {row[3]}, {row[4]}, now())
+                VALUES ('{row[0]}', {row[1]}, 0, 0, {row[2]}, now())
             """)
         
         logger.info(f"✅ Загружено {len(result)} записей в dm_daily_active_users")
@@ -349,7 +338,7 @@ def ecommerce_consumer_dag():
     def log_summary(daily_count, category_count, user_count, products_count, dau_count):
         """Логирование итоговой статистики"""
         logger.info("=" * 60)
-        logger.info("📊 CONSUMER DAG COMPLETED (из DDS слоя)")
+        logger.info("📊 CONSUMER DAG COMPLETED")
         logger.info(f"   dm_daily_sales: {daily_count} records")
         logger.info(f"   dm_category_performance: {category_count} records")
         logger.info(f"   dm_user_behavior: {user_count} records")
