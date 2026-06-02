@@ -29,7 +29,8 @@ COUNTRIES = ["USA", "UK", "Germany", "France", "Canada", "Australia", "Japan", "
     start_date=datetime(2026, 1, 1),
     schedule="* * * * *",  # Every 1 min
     catchup=False,
-    tags=["ecommerce", "generator", "mongodb"]
+    tags=["ecommerce", "generator", "mongodb"],
+    description="Генерирует данные для MongoDB"
 )
 def data_generator_to_mongodb():
     
@@ -64,7 +65,7 @@ def data_generator_to_mongodb():
                 inserted = collection.insert_many(users, ordered=False)
                 
                 logger.info(f"✅ Сгенерировано пользователей: {len(inserted.inserted_ids)}")
-                return len(inserted.inserted_ids)
+                return [u["user_id"] for u in users]
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
             raise
@@ -97,30 +98,18 @@ def data_generator_to_mongodb():
                 inserted = collection.insert_many(products, ordered=False)
                 
                 logger.info(f"✅ Сгенерировано товаров: {len(inserted.inserted_ids)}")
-                return len(inserted.inserted_ids)
+                return [{"product_id": p["product_id"], "price": p["price"]} for p in products]
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
             raise
     
     @task
-    def generate_orders():
+    def generate_orders(user_ids, products_list):
         """Orders in MongoDB"""
         mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
         
-        try:
-            with MongoClient(mongo_uri) as client:
-                db = client["source_db"]
-                users = list(db["ecommerce_users"].find({}, {"user_id": 1, "_id": 0}))
-                products = list(db["ecommerce_products"].find({"price": {"$gt": 0}}, {"product_id": 1, "price": 1, "_id": 0}))
-                
-                if not users or not products:
-                    logger.warning("Нет данных для создания заказов")
-                    return 0
-                
-                user_ids = [u["user_id"] for u in users]
-                products_list = [(p["product_id"], p["price"]) for p in products]
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
+        if not user_ids or not products_list:
+            logger.warning("Нет данных для создания заказов")
             return 0
         
         num_orders = random.randint(5, 20)
@@ -133,7 +122,9 @@ def data_generator_to_mongodb():
             total = 0
             
             for _ in range(num_items):
-                product_id, price = random.choice(products_list)
+                product = random.choice(products_list)
+                product_id = product["product_id"]
+                price = product["price"]
                 quantity = random.randint(1, 3)
                 item_total = price * quantity
                 total += item_total
@@ -167,20 +158,12 @@ def data_generator_to_mongodb():
             raise
     
     @task
-    def generate_events():
+    def generate_events(user_ids):
         """Events in MongoDB"""
         mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
         
-        try:
-            with MongoClient(mongo_uri) as client:
-                db = client["source_db"]
-                users = list(db["ecommerce_users"].find({}, {"user_id": 1, "_id": 0}))
-                if not users:
-                    logger.warning("Нет пользователей для генерации событий")
-                    return 0
-                user_ids = [u["user_id"] for u in users]
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
+        if not user_ids:
+            logger.warning("Нет пользователей для генерации событий")
             return 0
         
         num_events = random.randint(20, 100)
@@ -211,11 +194,43 @@ def data_generator_to_mongodb():
             logger.error(f"❌ Ошибка: {e}")
             raise
     
-    # Параллельный запуск всех генераторов
-    generate_users()
-    generate_products()
-    generate_orders()
-    generate_events()
+    @task
+    def log_stats():
+        """Log statistics"""
+        mongo_uri = Variable.get("mongo_uri", default_var="mongodb://airflow:airflow@mongodb:27017/")
+        
+        try:
+            with MongoClient(mongo_uri) as client:
+                db = client["source_db"]
+                
+                users_count = db["ecommerce_users"].count_documents({})
+                products_count = db["ecommerce_products"].count_documents({})
+                orders_count = db["ecommerce_orders"].count_documents({})
+                events_count = db["ecommerce_events"].count_documents({})
+                
+                logger.info("=" * 60)
+                logger.info("📊 MongoDB Statistics:")
+                logger.info(f"   Users: {users_count}")
+                logger.info(f"   Products: {products_count}")
+                logger.info(f"   Orders: {orders_count}")
+                logger.info(f"   Events: {events_count}")
+                logger.info("=" * 60)
+        except Exception as e:
+            logger.error(f"Error: {e}")
+    
+    # Define dependencies - sequential order
+    user_ids = generate_users()
+    products_list = generate_products()
+    
+    orders_count = generate_orders(user_ids, products_list)
+    events_count = generate_events(user_ids)
+    
+    stats = log_stats()
+    
+    user_ids >> products_list
+    [user_ids, products_list] >> orders_count
+    user_ids >> events_count
+    [orders_count, events_count] >> stats
 
 
 dag = data_generator_to_mongodb()
