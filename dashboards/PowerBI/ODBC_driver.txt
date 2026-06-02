@@ -1,0 +1,4 @@
+Details: "The 'Driver' property with value '{ClickHouse ODBC Driver (Unicode)}' doesn't correspond to a user-installed ODBC driver."
+
+Download driver from
+https://github.com/ClickHouse/clickhouse-odbc/releases
