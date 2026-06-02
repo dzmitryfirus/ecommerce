@@ -561,7 +561,7 @@ def ecommerce_producer_dag():
         return len(valid_events)
     
     # ============================================================
-    # TRANSFORM TO DDS (ИСПРАВЛЕНО)
+    # TRANSFORM TO DDS
     # ============================================================
     
     @task
@@ -599,28 +599,16 @@ def ecommerce_producer_dag():
     
     @task
     def transform_user_dimension():
-        """Заполнение измерения Пользователь (SCD Type 2) - ИСПРАВЛЕНО"""
+        """Заполнение измерения Пользователь """
         hook = PostgresHook(postgres_conn_id="warehouse_postgres_conn")
         
-        # Получаем максимальную дату загрузки
-        max_loaded = hook.get_first("""
-            SELECT COALESCE(MAX(loaded_at), '1900-01-01'::timestamp) 
-            FROM dds_dim_users WHERE is_current = TRUE
-        """)[0]
-        
-        # Закрываем старые версии пользователей
+        # Отмечаем всех текущих пользователей как неактивных
         hook.run("""
-            UPDATE dds_dim_users 
-            SET valid_to = CURRENT_DATE - INTERVAL '1 day', is_current = FALSE
-            WHERE is_current = TRUE 
-            AND user_id IN (
-                SELECT DISTINCT user_id 
-                FROM stg_ecommerce_users 
-                WHERE loaded_at > %s
-            )
-        """, parameters=(max_loaded,))
+            UPDATE dds_dim_users SET is_current = FALSE, valid_to = CURRENT_DATE
+            WHERE is_current = TRUE
+        """)
         
-        # Вставляем новые версии
+        # Вставляем актуальных пользователей из staging
         hook.run("""
             INSERT INTO dds_dim_users 
                 (user_id, first_name, last_name, email, phone, country, age, age_group, lifetime_value, valid_from, is_current)
@@ -642,12 +630,11 @@ def ecommerce_producer_dag():
                 CURRENT_DATE as valid_from,
                 TRUE as is_current
             FROM stg_ecommerce_users s
-            LEFT JOIN dds_dim_users d ON d.user_id = s.user_id AND d.is_current = TRUE
-            WHERE d.user_id IS NULL
+            ON CONFLICT DO NOTHING
         """)
         
-        count = hook.get_first("SELECT COUNT(*) FROM dds_dim_users")[0]
-        logger.info(f"✅ Измерение Пользователь: {count} записей")
+        count = hook.get_first("SELECT COUNT(*) FROM dds_dim_users WHERE is_current = TRUE")[0]
+        logger.info(f"✅ Измерение Пользователь: {count} активных записей")
         return count
     
     @task
