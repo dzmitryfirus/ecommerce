@@ -17,3 +17,7 @@ Data Generator (Python)
                    │
                    ▼
         PowerBI / Metabase / Tableau (Dashboards)
+
+
+
+docker compose up
